@@ -1,0 +1,266 @@
+package com.example.idgenerator.service;
+
+import com.example.idgenerator.mapper.IdGeneratorMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * 高性能ID生成服务
+ * 基于OpenGauss数据库序列实现，使用批量预加载机制提高性能
+ * 支持分布式环境下的高并发ID生成，确保ID连续无空洞
+ */
+@Service
+public class IdGeneratorService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(IdGeneratorService.class);
+    
+    // 默认的ID预加载批量大小
+    private static final int DEFAULT_BATCH_SIZE = 1000;
+    
+    // 最小预加载数量，当缓存中的ID少于此值时触发新的预加载
+    private static final int MIN_CACHE_THRESHOLD = 100;
+    
+    // 最大单次批量生成ID数量
+    public static final int MAX_BATCH_COUNT = 10000;
+    
+    // ID缓存队列，用于存储预加载的ID
+    private final BlockingQueue<Long> idCache = new ArrayBlockingQueue<>(DEFAULT_BATCH_SIZE * 2);
+    
+    // 用于同步ID预加载操作的锁
+    private final ReentrantLock preloadLock = new ReentrantLock();
+    
+    // 标记是否正在进行预加载，避免重复触发
+    private final AtomicBoolean isPreloading = new AtomicBoolean(false);
+    
+    // 当前使用的批量大小
+    private final int batchSize;
+    
+    // ID生成器Mapper，用于从数据库获取ID
+    private final IdGeneratorMapper idGeneratorMapper;
+    
+    @Autowired
+    public IdGeneratorService(IdGeneratorMapper idGeneratorMapper) {
+        this.idGeneratorMapper = idGeneratorMapper;
+        this.batchSize = DEFAULT_BATCH_SIZE;
+        // 初始化时预加载一批ID
+        preloadIds(batchSize);
+    }
+    
+    /**
+     * 获取下一个ID
+     * 从预加载的缓存中分配，确保ID连续无空洞
+     * @return 生成的连续ID
+     */
+    public long getId() {
+        // 快速路径：直接从缓存中获取ID
+        Long id = idCache.poll();
+        if (id != null) {
+            // 检查是否需要预加载新的ID（避免缓存耗尽）
+            if (idCache.size() <= MIN_CACHE_THRESHOLD) {
+                // 异步预加载，不阻塞当前线程
+                triggerAsyncPreload();
+            }
+            return id;
+        }
+        
+        // 缓存为空，需要同步预加载
+        logger.debug("ID缓存为空，执行同步预加载");
+        
+        // 尝试获取预加载锁
+        if (preloadLock.tryLock()) {
+            try {
+                // 双重检查，避免在获取锁期间其他线程已加载
+                id = idCache.poll();
+                if (id == null) {
+                    // 预加载新的ID
+                    preloadIds(batchSize);
+                    id = idCache.poll();
+                    if (id == null) {
+                        throw new RuntimeException("Failed to preload IDs from database");
+                    }
+                }
+            } finally {
+                preloadLock.unlock();
+            }
+        } else {
+            // 如果无法获取锁，等待一下再尝试
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return getId(); // 递归重试
+        }
+        
+        return id;
+    }
+    
+    /**
+     * 批量获取ID
+     * @param count 需要的ID数量
+     * @return 连续的ID列表
+     */
+    public List<Long> getIds(int count) {
+        if (count <= 0 || count > MAX_BATCH_COUNT) {
+            throw new IllegalArgumentException("批量ID数量必须在1到10000之间");
+        }
+        
+        List<Long> result = new ArrayList<>(count);
+        int remainingCount = count;
+        
+        // 首先尝试从缓存中获取ID
+        while (remainingCount > 0) {
+            Long id = idCache.poll();
+            if (id == null) {
+                break;
+            }
+            result.add(id);
+            remainingCount--;
+        }
+        
+        // 如果缓存中的ID不足，需要预加载
+        if (remainingCount > 0) {
+            // 获取预加载锁
+            if (preloadLock.tryLock()) {
+                try {
+                    // 再次尝试从缓存获取，避免在获取锁期间其他线程已加载
+                    while (remainingCount > 0) {
+                        Long id = idCache.poll();
+                        if (id == null) {
+                            break;
+                        }
+                        result.add(id);
+                        remainingCount--;
+                    }
+                    
+                    if (remainingCount > 0) {
+                        // 预加载所需的剩余数量
+                        List<Long> newIds = preloadIds(remainingCount);
+                        // 添加到结果中
+                        for (int i = 0; i < Math.min(remainingCount, newIds.size()); i++) {
+                            Long id = newIds.get(i);
+                            result.add(id);
+                        }
+                    }
+                } finally {
+                    preloadLock.unlock();
+                }
+            } else {
+                // 如果无法获取锁，尝试逐个获取剩余ID
+                while (remainingCount > 0) {
+                    result.add(getId());
+                    remainingCount--;
+                }
+            }
+        }
+        
+        // 检查是否需要预加载更多ID
+        if (idCache.size() <= MIN_CACHE_THRESHOLD) {
+            triggerAsyncPreload();
+        }
+        
+        return result;
+    }
+    
+    /**
+     * 预加载指定数量的ID
+     * 使用数据库序列批量生成连续的ID
+     * @param count 预加载数量
+     * @return 加载的ID列表
+     */
+    private List<Long> preloadIds(int count) {
+        try {
+            logger.debug("预加载 {} 个ID", count);
+            
+            // 从数据库批量获取ID
+            List<Long> newIds = idGeneratorMapper.getIds(count);
+            
+            // 对获取的ID进行排序，确保连续性
+            newIds.sort(Long::compareTo);
+            
+            // 添加到缓存队列
+            for (Long id : newIds) {
+                boolean added = idCache.offer(id);
+                if (!added) {
+                    logger.warn("ID缓存已满，无法添加更多ID: {}", id);
+                }
+            }
+            
+            logger.debug("成功预加载 {} 个ID，当前缓存大小: {}", 
+                    newIds.size(), idCache.size());
+            
+            // 验证ID的连续性
+            validateIdSequence(newIds);
+            
+            return newIds;
+        } catch (Exception e) {
+            logger.error("预加载ID失败: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to preload IDs", e);
+        }
+    }
+    
+    /**
+     * 触发异步预加载
+     */
+    private void triggerAsyncPreload() {
+        // 使用原子变量避免重复触发预加载
+        if (isPreloading.compareAndSet(false, true)) {
+            // 检查是否已有预加载线程在运行
+            if (preloadLock.tryLock()) {
+                try {
+                    // 再次检查缓存大小，避免不必要的加载
+                    if (idCache.size() <= MIN_CACHE_THRESHOLD) {
+                        // 同步预加载，避免创建过多线程导致连接数激增
+                        preloadIds(batchSize);
+                    }
+                } catch (Exception e) {
+                    logger.error("预加载失败: {}", e.getMessage(), e);
+                } finally {
+                    preloadLock.unlock();
+                    isPreloading.set(false);
+                }
+            } else {
+                isPreloading.set(false);
+            }
+        }
+    }
+    
+    /**
+     * 验证ID序列的连续性
+     * @param ids ID列表
+     */
+    private void validateIdSequence(List<Long> ids) {
+        if (ids.isEmpty() || ids.size() == 1) {
+            return;
+        }
+        
+        long prevId = ids.get(0);
+        for (int i = 1; i < ids.size(); i++) {
+            long currentId = ids.get(i);
+            if (currentId != prevId + 1) {
+                logger.warn("检测到ID不连续: 前一个ID={}, 当前ID={}", prevId, currentId);
+                break;
+            }
+            prevId = currentId;
+        }
+    }
+    
+    /**
+     * 获取当前缓存中的ID数量
+     * 主要用于监控和调试
+     * @return 缓存中的ID数量
+     */
+    public int getCacheSize() {
+        return idCache.size();
+    }
+
+}
