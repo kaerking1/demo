@@ -1,0 +1,321 @@
+package com.kaerking.mqservice.consumer;
+
+import com.google.common.collect.Lists;
+import com.kaerking.mqservice.entity.T1;
+import com.kaerking.mqservice.entity.T2;
+import com.kaerking.mqservice.mapper.T1Mapper;
+import com.kaerking.mqservice.mapper.T2Mapper;
+import com.kaerking.mqservice.model.TopicAMessage;
+import com.kaerking.mqservice.model.TopicBMessage;
+import com.kaerking.mqservice.producer.TopicBProducer;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
+import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.Resource;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+/**
+ * TopicA消费者
+ * 接收TopicA的消息，查询数据库后发送到TopicB
+ * 
+ */
+@Slf4j
+@Component
+@RocketMQMessageListener(
+        topic = "topica",
+        consumerGroup = "topic-a-consumer-group",
+        consumeMode = org.apache.rocketmq.spring.annotation.ConsumeMode.CONCURRENTLY,
+        messageModel = org.apache.rocketmq.spring.annotation.MessageModel.CLUSTERING
+)
+public class TopicAConsumer implements RocketMQListener<TopicAMessage> {
+
+    @Resource
+    private T1Mapper t1Mapper;
+    
+    @Resource
+    private T2Mapper t2Mapper;
+    
+    @Resource
+    private TopicBProducer topicBProducer;
+
+    // TopicB消息批次大小（外层分组）
+    private static final int TOPICB_BATCH_SIZE = 500;
+    
+    // 数据库查询批次大小（内层拆分）
+    private static final int DB_QUERY_BATCH_SIZE = 100;
+    
+    // 并发查询线程池
+    private final ExecutorService queryExecutor = Executors.newFixedThreadPool(10);
+    
+    // 数据库查询超时时间（秒）
+    private static final int DB_QUERY_TIMEOUT_SECONDS = 30;
+    
+    // 数据库并发查询信号量（限制同时进行的数据库查询数量，避免压垮数据库）
+    private final Semaphore dbQuerySemaphore = new Semaphore(5);
+    
+    @Override
+    public void onMessage(TopicAMessage message) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            log.info("接收到TopicA消息: id={}, depList大小={}", 
+                    message.getId(), message.getDepList() != null ? message.getDepList().size() : 0);
+
+            // 参数校验
+            if (message.getDepList() == null || message.getDepList().isEmpty()) {
+                log.warn("部门ID列表为空，跳过处理");
+                return;
+            }
+
+            // 外层分组：使用Guava将部门ID列表按TOPICB_BATCH_SIZE（500）分组
+            List<List<String>> topicBBatches = Lists.partition(message.getDepList(), TOPICB_BATCH_SIZE);
+            int totalSize = topicBBatches.size();
+            
+            log.info("外层分组完成，TopicB消息总批次: {}", totalSize);
+
+            // 处理每个外层批次
+            for (int i = 0; i < topicBBatches.size(); i++) {
+                List<String> topicBBatch = topicBBatches.get(i);
+                int currentBatch = i + 1;
+                
+                try {
+                    long batchStartTime = System.currentTimeMillis();
+                    
+                    log.info("开始处理第 {}/{} 批TopicB消息，部门数量: {}", 
+                            currentBatch, totalSize, topicBBatch.size());
+                    
+                    // 内层拆分：将每个外层批次再按DB_QUERY_BATCH_SIZE（100）拆分
+                    List<List<String>> dbQueryBatches = Lists.partition(topicBBatch, DB_QUERY_BATCH_SIZE);
+                    
+                    log.info("内层拆分完成，数据库查询批次: {}", dbQueryBatches.size());
+                    
+                    // 使用CompletableFuture链式操作并发查询数据库
+                    List<CompletableFuture<BatchQueryResult>> futures = dbQueryBatches.stream()
+                            .map(this::queryDatabaseBatch)  // 直接传递方法引用，返回CompletableFuture
+                            .collect(Collectors.toList());
+                    
+                    // 等待所有查询完成并合并结果
+                    CompletableFuture<Void> allFutures = CompletableFuture.allOf(
+                            futures.toArray(new CompletableFuture[0]));
+                    
+                    allFutures.join(); // 等待所有查询完成
+                    
+                    // 合并所有查询结果
+                    List<TopicBMessage.DepartmentResult> allResults = futures.stream()
+                            .map(CompletableFuture::join)
+                            .flatMap(result -> result.getResults().stream())
+                            .collect(Collectors.toList());
+                    
+                    log.info("数据库查询完成，总记录数: {}", allResults.size());
+                    
+                    // 构建TopicB消息
+                    TopicBMessage topicBMessage = TopicBMessage.builder()
+                            .id(message.getId())
+                            .totalSize(totalSize)
+                            .currentSize(currentBatch)
+                            .result(allResults)
+                            .build();
+                    
+                    // 发送到TopicB
+                    topicBProducer.sendMessage(topicBMessage);
+                    
+                    long batchDuration = System.currentTimeMillis() - batchStartTime;
+                    log.info("第 {}/{} 批TopicB消息处理完成，耗时: {}ms", 
+                            currentBatch, totalSize, batchDuration);
+                    
+                } catch (Exception e) {
+                    log.error("第 {}/{} 批TopicB消息处理失败", currentBatch, totalSize, e);
+                    // 可以选择发送失败消息或者跳过
+                }
+            }
+
+            long endTime = System.currentTimeMillis();
+            log.info("TopicA消息处理完成，总耗时: {}ms", endTime - startTime);
+
+        } catch (Exception e) {
+            log.error("处理TopicA消息失败", e);
+            throw e; // 重新抛出异常，RocketMQ会重试
+        }
+    }
+
+    /**
+     * 查询单个数据库批次（使用CompletableFuture链式操作优化版本 + 异常处理 + 超时控制 + 并发控制）
+     * 
+     * 优化策略：
+     * 1. 使用supplyAsync异步查询T1表
+     * 2. 使用thenCompose处理T1结果，异步查询T2表
+     * 3. 使用thenApply合并T1和T2的结果
+     * 4. 避免嵌套循环，时间复杂度从O(n×m)降低到O(n+m)
+     * 5. 完善的异常处理机制
+     * 6. 超时控制：使用orTimeout防止查询时间过长导致线程池耗尽
+     * 7. 并发控制：使用信号量限制同时进行的数据库查询数量，避免压垮数据库
+     * 
+     * @param depIds 部门ID列表
+     * @return CompletableFuture<BatchQueryResult>
+     */
+    private CompletableFuture<BatchQueryResult> queryDatabaseBatch(List<String> depIds) {
+        long startTime = System.currentTimeMillis();
+        
+        log.info("开始查询数据库批次，部门数量: {}, 当前可用信号量许可: {}", 
+                depIds.size(), dbQuerySemaphore.availablePermits());
+        
+        // 获取信号量许可（限制并发查询数量）
+        try {
+            boolean acquired = dbQuerySemaphore.tryAcquire(5, TimeUnit.SECONDS);
+            if (!acquired) {
+                log.error("获取数据库查询信号量超时，当前可用许可: {}", dbQuerySemaphore.availablePermits());
+                return CompletableFuture.completedFuture(new BatchQueryResult(Collections.emptyList()));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("获取数据库查询信号量被中断", e);
+            return CompletableFuture.completedFuture(new BatchQueryResult(Collections.emptyList()));
+        }
+        
+        log.info("获取数据库查询信号量成功，当前可用许可: {}", dbQuerySemaphore.availablePermits());
+        
+        // 第一步：异步查询T1表
+        CompletableFuture<BatchQueryResult> queryFuture = CompletableFuture.supplyAsync(() -> {
+            long t1StartTime = System.currentTimeMillis();
+            try {
+                List<T1> t1List = t1Mapper.selectByDepIds(depIds);
+                long t1Duration = System.currentTimeMillis() - t1StartTime;
+                log.info("T1表查询完成，返回记录数: {}, 耗时: {}ms", t1List.size(), t1Duration);
+                return t1List;
+            } catch (Exception e) {
+                log.error("T1表查询失败，部门ID列表: {}", depIds, e);
+                throw new RuntimeException("T1表查询失败", e);
+            }
+        }, queryExecutor)
+        
+        // T1查询异常处理
+        .exceptionally(ex -> {
+            log.error("T1表查询异常处理，返回空列表", ex);
+            return Collections.emptyList();
+        })
+        
+        // 第二步：使用thenCompose处理T1结果，异步查询T2表
+        .thenCompose(t1List -> {
+            // 如果T1查询失败返回空列表，直接返回空结果
+            if (t1List.isEmpty()) {
+                log.warn("T1表查询结果为空，跳过T2查询");
+                return CompletableFuture.completedFuture(new BatchQueryResult(Collections.emptyList()));
+            }
+            
+            // 提取T1表中的所有depId
+            List<String> depIdsFromT1 = t1List.stream()
+                    .map(T1::getDepId)
+                    .collect(Collectors.toList());
+            
+            log.info("从T1表提取depId数量: {}", depIdsFromT1.size());
+            
+            // 异步查询T2表
+            return CompletableFuture.supplyAsync(() -> {
+                long t2StartTime = System.currentTimeMillis();
+                try {
+                    List<T2> t2List = t2Mapper.selectByDepIds(depIdsFromT1);
+                    long t2Duration = System.currentTimeMillis() - t2StartTime;
+                    log.info("T2表查询完成，返回记录数: {}, 耗时: {}ms", t2List.size(), t2Duration);
+                    return t2List;
+                } catch (Exception e) {
+                    log.error("T2表查询失败，部门ID列表: {}", depIdsFromT1, e);
+                    throw new RuntimeException("T2表查询失败", e);
+                }
+            }, queryExecutor)
+            
+            // T2查询异常处理
+            .exceptionally(ex -> {
+                log.error("T2表查询异常处理，返回空列表", ex);
+                return Collections.emptyList();
+            })
+            
+            // 第三步：合并T1和T2的结果
+            .thenApply(t2List -> {
+                long mergeStartTime = System.currentTimeMillis();
+                
+                try {
+                    // 将T2数据按depId分组 - O(m)操作
+                    Map<String, List<T2>> t2Map = t2List.stream()
+                            .collect(Collectors.groupingBy(T2::getDepId));
+                    
+                    // 构建结果列表 - O(n)操作
+                    List<TopicBMessage.DepartmentResult> results = t1List.stream()
+                            .map(t1 -> {
+                                List<T2> t2DataList = t2Map.getOrDefault(t1.getDepId(), Collections.emptyList());
+                                
+                                List<TopicBMessage.T2Data> t2DataListConverted = t2DataList.stream()
+                                        .map(t2 -> TopicBMessage.T2Data.builder()
+                                                .depSize(t2.getDepSize())
+                                                .depType(t2.getDepType())
+                                                .depSubType(t2.getDepSubType())
+                                                .depName(t1.getDepName()) // 从T1表获取部门名称
+                                                .build())
+                                        .collect(Collectors.toList());
+                                
+                                return TopicBMessage.DepartmentResult.builder()
+                                        .depId(t1.getDepId())
+                                        .t2List(t2DataListConverted)
+                                        .build();
+                            })
+                            .collect(Collectors.toList());
+                    
+                    long mergeDuration = System.currentTimeMillis() - mergeStartTime;
+                    long totalDuration = System.currentTimeMillis() - startTime;
+                    
+                    log.info("数据合并完成，部门数量: {}, 结果记录数: {}, 合并耗时: {}ms, 总耗时: {}ms", 
+                            depIds.size(), results.size(), mergeDuration, totalDuration);
+                    
+                    return new BatchQueryResult(results);
+                    
+                } catch (Exception e) {
+                    log.error("数据合并失败", e);
+                    throw new RuntimeException("数据合并失败", e);
+                }
+            });
+        })
+        
+        // 整体异常处理（捕获所有未处理的异常）
+        .exceptionally(ex -> {
+            log.error("数据库批次查询整体异常，返回空结果", ex);
+            return new BatchQueryResult(Collections.emptyList());
+        });
+        
+        // 添加超时控制
+        queryFuture.orTimeout(DB_QUERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .exceptionally(ex -> {
+                    if (ex instanceof TimeoutException) {
+                        log.error("数据库批次查询超时（{}秒），部门数量: {}", DB_QUERY_TIMEOUT_SECONDS, depIds.size());
+                    } else {
+                        log.error("数据库批次查询异常", ex);
+                    }
+                    return new BatchQueryResult(Collections.emptyList());
+                });
+        
+        // 无论成功或失败，都要释放信号量许可
+        return queryFuture.whenComplete((result, ex) -> {
+            dbQuerySemaphore.release();
+            long totalDuration = System.currentTimeMillis() - startTime;
+            log.info("释放数据库查询信号量，当前可用许可: {}, 总耗时: {}ms", 
+                    dbQuerySemaphore.availablePermits(), totalDuration);
+        });
+    }
+
+    /**
+     * 批次查询结果封装类
+     */
+    private static class BatchQueryResult {
+        private final List<TopicBMessage.DepartmentResult> results;
+
+        public BatchQueryResult(List<TopicBMessage.DepartmentResult> results) {
+            this.results = results;
+        }
+
+        public List<TopicBMessage.DepartmentResult> getResults() {
+            return results;
+        }
+    }
+}
